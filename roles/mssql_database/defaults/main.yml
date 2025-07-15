@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT-0
+---
+# defaults file for roles/mssql_database
+
+# Default log autogrowth type - changed from 'percent' to 'fixed_size'
+# to align with Microsoft's best practices for production environments
+mssql_database_default_log_autogrowth_type: 'fixed_size'
+
+# Default log growth value (in MB) for fixed_size growth type
+mssql_database_default_log_autogrowth_fixed_value: 64
+
+# Default log growth percentage for percent growth type (not recommended for production)
+mssql_database_default_log_autogrowth_percent_value: 10
+
+# Default maximum size type
+mssql_database_default_log_max_size_type: 'limited'
+
+# Default maximum size in MB (for limited type)
+mssql_database_default_log_max_size_mb: 1024

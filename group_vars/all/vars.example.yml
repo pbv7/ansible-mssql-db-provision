@@ -1,0 +1,52 @@
+---
+# Database collation settings allowed by your organization
+# Recommendation: Limit to collations actually used in your environment
+allowed_collations:
+  - Latin1_General_CI_AS  # SQL Server default collation
+  - Ukrainian_CI_AS       # Case-insensitive Ukrainian collation
+
+# Database owners allowed by your organization
+# Security recommendation: Use dedicated service accounts, not sa or administrators
+allowed_owners:
+  - dbuser1  # Replace with actual database service accounts
+  - dbuser2
+  - admin    # Avoid using in production
+
+# SQL Server compatibility levels permitted
+# These values correspond to specific SQL Server versions:
+# 130 = SQL Server 2016
+# 140 = SQL Server 2017
+# 150 = SQL Server 2019
+# 160 = SQL Server 2022
+allowed_compatibility_levels:
+  - 130
+  - 140
+  - 150
+  - 160
+
+# Log file autogrowth strategies
+# percent: Grows by percentage of current size (not recommended by Microsoft for production)
+# fixed_size: Grows by fixed MB amount (Microsoft best practice for production)
+allowed_log_autogrowth_types:
+  - percent
+  - fixed_size
+
+# Maximum size limit types
+# limited: Sets a specific MB limit
+# unlimited: Allows unlimited growth (use with caution in production)
+allowed_max_size_types:
+  - limited
+  - unlimited
+
+# Limits for log autogrowth values
+# These help prevent performance issues from extreme settings
+log_autogrowth_limits:
+  percent:
+    min: 1     # Minimum allowed percentage growth
+    max: 50    # Maximum allowed percentage growth (larger can cause issues)
+                # NOTE: Microsoft recommends fixed-size growth over percentage-based for production
+  fixed_size:
+    min_mb: 1      # Minimum growth increment in MB
+    max_mb: 1024   # Maximum growth increment in MB
+                   # Microsoft recommends values between 64MB-512MB for most databases
+                   # Large values (>1GB) can cause performance issues during log expansion

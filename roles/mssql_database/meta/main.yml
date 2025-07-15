@@ -1,0 +1,6 @@
+galaxy_info:
+    author: Bohdan Potishuk
+    description: Create Microsoft SQL Server databases and configure parameters such as collation, compatibility level, and ownership.
+    license: MIT
+    min_ansible_version: "2.9"
+dependencies: []

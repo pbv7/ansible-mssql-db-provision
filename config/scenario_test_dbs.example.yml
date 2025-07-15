@@ -1,0 +1,52 @@
+# MSSQL connection details (specific to this scenario)
+runtime_mssql_host: "{{ lookup('env', 'MSSQL_TEST_HOST') }}"  # Hostname or IP address of the SQL Server
+runtime_mssql_port: "{{ lookup('env', 'MSSQL_TEST_PORT') | default(1433) }}"  # Port number (default: 1433)
+runtime_mssql_user: "{{ lookup('env', 'MSSQL_TEST_USER') }}"  # Username for SQL Server authentication
+runtime_mssql_password: "{{ lookup('env', 'MSSQL_TEST_PASSWORD') }}"  # Password (use environment variable or Ansible Vault)
+
+# List of databases to provision
+mssql_databases:
+  # Example 1: Percentage-based growth with limited maximum size
+  # NOTE: Microsoft recommends fixed-size growth for production environments
+  - name: db-test1
+    owner: dbuser1  # Database owner
+    collation: Latin1_General_CI_AS  # Collation setting
+    compatibility: 130  # Compatibility level
+    log_autogrowth:
+      type: percent  # Growth type: percentage-based (not recommended for production)
+      value: 5  # Growth increment (5%)
+      max_size_type: limited  # Maximum size type: limited
+      max_size_mb: 1024  # Maximum size in MB
+
+  # Example 2: Fixed-size growth with unlimited maximum size
+  # NOTE: This follows Microsoft's best practice recommendation for production
+  - name: db-test2
+    owner: dbuser2
+    collation: Ukrainian_CI_AS
+    compatibility: 130
+    log_autogrowth:
+      type: fixed_size  # Growth type: fixed-size (Microsoft recommended best practice)
+      value: 64  # Growth increment (64 MB)
+      max_size_type: unlimited  # Maximum size type: unlimited
+
+  # Example 3: Fixed-size growth with limited maximum size
+  - name: db-test3
+    owner: dbuser3
+    collation: Latin1_General_CI_AS
+    compatibility: 140
+    log_autogrowth:
+      type: fixed_size
+      value: 512  # Growth increment (512 MB)
+      max_size_type: limited
+      max_size_mb: 2048  # Maximum size in MB
+
+  # Example 4: Percentage-based growth with unlimited maximum size
+  # NOTE: Microsoft recommends fixed-size growth instead of percentage-based for production
+  - name: db-test4
+    owner: dbuser4
+    collation: Ukrainian_CI_AS
+    compatibility: 150
+    log_autogrowth:
+      type: percent  # Not recommended for production environments
+      value: 10  # Growth increment (10%)
+      max_size_type: unlimited

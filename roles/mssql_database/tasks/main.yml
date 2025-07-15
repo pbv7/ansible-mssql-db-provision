@@ -1,0 +1,348 @@
+---
+- name: Check if running on primary replica
+  community.general.mssql_script:
+      login_host: "{{ runtime_mssql_host }}"
+      login_port: "{{ runtime_mssql_port | default(1433) }}"
+      login_user: "{{ runtime_mssql_user }}"
+      login_password: "{{ runtime_mssql_password }}"
+      db: master
+      output: dict
+      script: |
+          DECLARE @is_primary INT = 1; -- Default to primary for standalone servers
+
+          -- Check if AlwaysOn AG is available (SQL 2012+)
+          IF OBJECT_ID('sys.dm_hadr_availability_replica_states') IS NOT NULL
+          BEGIN
+              -- Check if server is part of AG
+              IF EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states)
+              BEGIN
+                  -- Get local replica role
+                  SELECT @is_primary =
+                      CASE WHEN role_desc = 'PRIMARY' THEN 1 ELSE 0 END
+                  FROM sys.dm_hadr_availability_replica_states
+                  WHERE is_local = 1;
+              END
+          END
+
+          -- Check if server is part of a traditional failover cluster
+          DECLARE @is_clustered BIT = CONVERT(BIT, SERVERPROPERTY('IsClustered'));
+          DECLARE @node_name NVARCHAR(128) = CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS NVARCHAR(128));
+
+          -- Return results
+          SELECT
+              @node_name AS node_name,
+              @is_clustered AS is_clustered,
+              @is_primary AS is_primary;
+  register: cluster_check
+  changed_when: false
+  ignore_errors: true
+
+- name: Set is_primary_replica variable
+  ansible.builtin.set_fact:
+      is_primary_replica: >-
+        {{
+          cluster_check is success
+          and cluster_check.query_results_dict[0]|length > 0
+          and cluster_check.query_results_dict[0][0][0].is_primary|int == 1
+        }}
+
+- name: Fail if not running on primary replica (only if check succeeded)
+  ansible.builtin.assert:
+      that:
+          - is_primary_replica
+      fail_msg: >
+          This instance appears to be a secondary/replica node. Database creation
+          operations should only be performed on the primary node.
+  when: cluster_check is success and cluster_check.query_results_dict[0]|length > 0
+
+- name: Skip primary replica check (if check failed)
+  ansible.builtin.debug:
+      msg: >
+          Unable to determine if this is a primary replica. Proceeding with caution.
+          This may be due to running on a standalone instance or an older SQL Server version.
+  when: cluster_check.failed
+
+- name: Query for existing databases
+  community.general.mssql_script:
+      login_host: "{{ runtime_mssql_host }}"
+      login_port: "{{ runtime_mssql_port | default(1433) }}"
+      login_user: "{{ runtime_mssql_user }}"
+      login_password: "{{ runtime_mssql_password }}"
+      db: master
+      output: dict
+      script: |
+          SELECT name FROM sys.databases WHERE name = %(dbname)s;
+      params:
+          dbname: "{{ item.name }}"
+  loop: "{{ mssql_databases }}"
+  register: db_exists_results
+  changed_when: false
+  loop_control:
+      label: "{{ item.name }}"
+      index_var: db_idx
+
+- name: Fail if database already exists
+  ansible.builtin.fail:
+      msg: "Database {{ mssql_databases[db_idx].name }} already exists."
+  when: db_exists_results.results[db_idx].query_results_dict[0] | length > 0
+  loop: "{{ db_exists_results.results }}"
+  loop_control:
+      index_var: db_idx
+
+- name: Validate database configurations
+  ansible.builtin.assert:
+      that:
+          - item.owner in allowed_owners
+          - item.collation in allowed_collations
+          - item.compatibility in allowed_compatibility_levels
+      fail_msg: >
+          Invalid parameters for database {{ item.name }}:
+          {% if item.owner not in allowed_owners %}
+          - Owner '{{ item.owner }}' not in allowed list: {{ allowed_owners | join(', ') }}
+          {% endif %}
+          {% if item.collation not in allowed_collations %}
+          - Collation '{{ item.collation }}' not in allowed list: {{ allowed_collations | join(', ') }}
+          {% endif %}
+          {% if item.compatibility not in allowed_compatibility_levels %}
+          - Compatibility level '{{ item.compatibility }}' not in allowed list: {{ allowed_compatibility_levels | join(', ') }}
+          {% endif %}
+  loop: "{{ mssql_databases }}"
+
+- name: Validate log autogrowth configuration
+  ansible.builtin.assert:
+      that:
+          - (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) in allowed_log_autogrowth_types
+          - item.log_autogrowth.value is defined
+          - (item.log_autogrowth.max_size_type | default('limited')) in allowed_max_size_types
+      fail_msg: "Invalid log autogrowth configuration for database {{ item.name }}"
+  loop: "{{ mssql_databases }}"
+
+- name: Validate log autogrowth value limits (percent)
+  ansible.builtin.assert:
+      that:
+          - (item.log_autogrowth.value | int) >= log_autogrowth_limits.percent.min
+          - (item.log_autogrowth.value | int) <= log_autogrowth_limits.percent.max
+      fail_msg: >
+          Log autogrowth percent out of range for database {{ item.name }}:
+          Value {{ item.log_autogrowth.value }}% is outside the allowed range of
+          {{ log_autogrowth_limits.percent.min }}% to {{ log_autogrowth_limits.percent.max }}%
+  when: (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'percent'
+  loop: "{{ mssql_databases }}"
+
+- name: Validate log autogrowth value limits (fixed size)
+  ansible.builtin.assert:
+      that:
+          - (item.log_autogrowth.value | int) >= log_autogrowth_limits.fixed_size.min_mb
+          - (item.log_autogrowth.max_size_type | default('limited') == 'unlimited') or
+            ((item.log_autogrowth.value | int) <= log_autogrowth_limits.fixed_size.max_mb)
+      fail_msg: >
+          Log autogrowth size out of range for database {{ item.name }}:
+          Value {{ item.log_autogrowth.value }} is outside the allowed range of
+          {{ log_autogrowth_limits.fixed_size.min_mb }} to {{ log_autogrowth_limits.fixed_size.max_mb }}
+  when: (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'fixed_size'
+  loop: "{{ mssql_databases }}"
+
+- name: Create and configure database
+  community.general.mssql_script:
+      login_host: "{{ runtime_mssql_host }}"
+      login_port: "{{ runtime_mssql_port | default(1433) }}"
+      login_user: "{{ runtime_mssql_user }}"
+      login_password: "{{ runtime_mssql_password }}"
+      db: master
+      output: dict
+      script: |
+          IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name='{{ item.name }}')
+          BEGIN
+            CREATE DATABASE [{{ item.name }}] COLLATE {{ item.collation }};
+            ALTER DATABASE [{{ item.name }}] SET COMPATIBILITY_LEVEL = {{ item.compatibility }};
+            ALTER AUTHORIZATION ON DATABASE::[{{ item.name }}] TO [{{ item.owner }}];
+            ALTER DATABASE [{{ item.name }}] SET RECOVERY FULL;
+          END
+  loop: "{{ mssql_databases }}"
+
+- name: Verify compatibility, collation, and owner settings
+  community.general.mssql_script:
+      login_host: "{{ runtime_mssql_host }}"
+      login_port: "{{ runtime_mssql_port | default(1433) }}"
+      login_user: "{{ runtime_mssql_user }}"
+      login_password: "{{ runtime_mssql_password }}"
+      db: master
+      output: dict
+      script: |
+          SET NOCOUNT ON;
+          SELECT name, collation_name, compatibility_level, suser_sname(owner_sid) AS owner
+          FROM sys.databases WHERE name = %(dbname)s;
+      params:
+          dbname: "{{ item.name }}"
+  loop: "{{ mssql_databases }}"
+  register: verify_results
+  changed_when: false
+  loop_control:
+      loop_var: item
+      index_var: db_idx
+
+- name: Assert compatibility, collation, and owner match expected values
+  ansible.builtin.assert:
+      that:
+          - verify_results.results[db_idx].query_results_dict[0][0][0].compatibility_level == item.compatibility
+          - verify_results.results[db_idx].query_results_dict[0][0][0].collation_name == item.collation
+          - verify_results.results[db_idx].query_results_dict[0][0][0].owner == item.owner
+      fail_msg: "Database {{ item.name }} has mismatched configuration"
+  loop: "{{ mssql_databases }}"
+  loop_control:
+      loop_var: item
+      index_var: db_idx
+
+- name: Configure log autogrowth
+  community.general.mssql_script:
+      login_host: "{{ runtime_mssql_host }}"
+      login_port: "{{ runtime_mssql_port | default(1433) }}"
+      login_user: "{{ runtime_mssql_user }}"
+      login_password: "{{ runtime_mssql_password }}"
+      db: master
+      output: dict
+      script: |
+          DECLARE @logname NVARCHAR(128);
+          SELECT @logname = name
+            FROM sys.master_files
+            WHERE database_id = DB_ID('{{ item.name }}')
+              AND type_desc = 'LOG';
+
+          IF @logname IS NOT NULL
+          BEGIN
+            -- Set autogrowth settings with proper MAXSIZE directly
+            EXEC(
+              'ALTER DATABASE [' + '{{ item.name }}' +
+              '] MODIFY FILE (NAME = ''' + @logname + '''' +
+              {% if (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'fixed_size' %}
+                {% if (item.log_autogrowth.max_size_type | default('limited')) == 'unlimited' %}
+                ', FILEGROWTH = {{ item.log_autogrowth.value }}MB, MAXSIZE = UNLIMITED)'
+                {% else %}
+                ', FILEGROWTH = {{ item.log_autogrowth.value }}MB, MAXSIZE = {{ item.log_autogrowth.max_size_mb | default(1024) }}MB)'
+                {% endif %}
+              {% else %}
+                {% if (item.log_autogrowth.max_size_type | default('limited')) == 'unlimited' %}
+                ', FILEGROWTH = {{ item.log_autogrowth.value }}%, MAXSIZE = UNLIMITED)'
+                {% else %}
+                ', FILEGROWTH = {{ item.log_autogrowth.value }}%, MAXSIZE = {{ item.log_autogrowth.max_size_mb | default(1024) }}MB)'
+                {% endif %}
+              {% endif %}
+            );
+          END
+  loop: "{{ mssql_databases }}"
+  register: result_log_autogrowth
+
+- name: Verify log autogrowth settings
+  community.general.mssql_script:
+      login_host: "{{ runtime_mssql_host }}"
+      login_port: "{{ runtime_mssql_port | default(1433) }}"
+      login_user: "{{ runtime_mssql_user }}"
+      login_password: "{{ runtime_mssql_password }}"
+      db: master
+      output: dict
+      script: |
+          SELECT
+              name,
+              growth,
+              CASE WHEN is_percent_growth = 1
+                   THEN CAST(growth AS VARCHAR) + '%'
+                   ELSE CAST(growth * 8 / 1024 AS VARCHAR) + ' MB'
+              END AS growth_desc,
+              max_size,
+              CASE
+                  WHEN max_size = -1 OR max_size >= 268435456 THEN 'UNLIMITED'
+                  ELSE CAST(max_size * 8 / 1024 AS VARCHAR) + ' MB'
+              END AS max_size_desc,
+              is_percent_growth,
+              size * 8 / 1024 AS current_size_mb
+          FROM sys.master_files
+          WHERE database_id = DB_ID(%(dbname)s) AND type_desc = 'LOG';
+      params:
+          dbname: "{{ item.name }}"
+  loop: "{{ mssql_databases }}"
+  register: verify_log_results
+  changed_when: false
+  loop_control:
+      loop_var: item
+      index_var: log_idx
+
+- name: Assert log autogrowth settings match expected values (percent with limited size)
+  ansible.builtin.assert:
+      that:
+          - verify_log_results.results[log_idx].query_results_dict[0][0][0].growth == item.log_autogrowth.value
+          - (verify_log_results.results[log_idx].query_results_dict[0][0][0].max_size | int * 8 / 1024) == item.log_autogrowth.max_size_mb
+      fail_msg: "Log file for database {{ item.name }} has mismatched autogrowth settings"
+  loop: "{{ mssql_databases }}"
+  when:
+      - (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'percent'
+      - (item.log_autogrowth.max_size_type | default('limited')) == 'limited'
+  loop_control:
+      loop_var: item
+      index_var: log_idx
+
+- name: Assert log autogrowth settings match expected values (percent with unlimited size)
+  ansible.builtin.assert:
+      that:
+          - verify_log_results.results[log_idx].query_results_dict[0][0][0].growth == item.log_autogrowth.value
+      fail_msg: "Log file for database {{ item.name }} has mismatched growth setting"
+  loop: "{{ mssql_databases }}"
+  when:
+      - (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'percent'
+      - (item.log_autogrowth.max_size_type | default('limited')) == 'unlimited'
+  loop_control:
+      loop_var: item
+      index_var: log_idx
+
+- name: Assert log autogrowth settings match expected values (fixed size with limited size)
+  ansible.builtin.assert:
+      that:
+          - (verify_log_results.results[log_idx].query_results_dict[0][0][0].growth | int * 8 / 1024) == item.log_autogrowth.value
+          - (verify_log_results.results[log_idx].query_results_dict[0][0][0].max_size | int * 8 / 1024) == item.log_autogrowth.max_size_mb
+      fail_msg: "Log file for database {{ item.name }} has mismatched autogrowth settings"
+  loop: "{{ mssql_databases }}"
+  when:
+      - (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'fixed_size'
+      - (item.log_autogrowth.max_size_type | default('limited')) == 'limited'
+  loop_control:
+      loop_var: item
+      index_var: log_idx
+
+- name: Assert log autogrowth settings match expected values (fixed size with unlimited size)
+  ansible.builtin.assert:
+      that:
+          - (verify_log_results.results[log_idx].query_results_dict[0][0][0].growth | int * 8 / 1024) == item.log_autogrowth.value
+      fail_msg: "Log file for database {{ item.name }} has mismatched growth setting"
+  loop: "{{ mssql_databases }}"
+  when:
+      - (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'fixed_size'
+      - (item.log_autogrowth.max_size_type | default('limited')) == 'unlimited'
+  loop_control:
+      loop_var: item
+      index_var: log_idx
+
+- name: Additional safety check for log file sizes
+  ansible.builtin.assert:
+      that:
+          - (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) != 'fixed_size' or
+            (item.log_autogrowth.value | int) <= 1024
+      fail_msg: >
+          WARNING: Fixed-size log growth exceeding 1024MB detected for {{ item.name }}!
+          Large fixed-size growth values (>1GB) can cause performance issues during log expansion.
+          Consider reducing to <= 1024MB (ideally between 64MB and 512MB).
+  loop: "{{ mssql_databases }}"
+  when: (item.log_autogrowth.type | default(mssql_database_default_log_autogrowth_type)) == 'fixed_size'
+
+- name: SQL Server Unlimited Log Size Notes
+  ansible.builtin.debug:
+      msg: >
+          Note on SQL Server Log File Size Behavior:
+          - When setting MAXSIZE = UNLIMITED, SQL Server represents this internally as a large number (268435456 pages).
+          - This is normal behavior, and our verification tasks account for this.
+          - In SQL Server Management Studio, this will show as "Unlimited" in the UI.
+          - Our verification query properly identifies unlimited sizes by checking for -1 OR values >= 268435456.
+  when:
+      - mssql_databases
+        | selectattr('log_autogrowth.max_size_type', 'defined')
+        | selectattr('log_autogrowth.max_size_type', 'equalto', 'unlimited')
+        | list
+        | length > 0

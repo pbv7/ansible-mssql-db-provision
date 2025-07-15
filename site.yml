@@ -1,0 +1,12 @@
+---
+- name: Provision MSSQL Databases
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - group_vars/all/vars.yml
+    - "{{ runtime_config_file }}"
+
+  roles:
+    - mssql_database
